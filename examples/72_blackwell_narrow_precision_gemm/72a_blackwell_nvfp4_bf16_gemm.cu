@@ -111,12 +111,12 @@ constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;    // M
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 // Kernel functional config
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
-using ArchTag             = cutlass::arch::Sm100;                           // Tag indicating the minimum SM that supports the intended feature
+using ArchTag             = cutlass::arch::Sm120;                           // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassBlockScaledTensorOp;      // Operator class tag
 
 // Kernel Perf config
-using MmaTileShape        = Shape<_256,_256,_256>;                          // MMA's tile size
-using ClusterShape        = Shape<_2,_4,_1>;                                // Shape of the threadblocks in a cluster
+using MmaTileShape        = Shape<_128,_128,_128>;                          // MMA's tile size
+using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -511,7 +511,7 @@ int main(int argc, char const **args) {
 
   CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
 
-  if (props.major != 10 || (props.minor != 0 && props.minor != 1 && props.minor != 3)) {
+  if (props.major < 10) {
     std::cerr << "This example requires a GPU with compute capability 100a|f, 101a|f, or 103a|f)." << std::endl;
     return 0;
   } 
