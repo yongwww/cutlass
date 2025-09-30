@@ -339,6 +339,27 @@ void initialize(const Options &options) {
   std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
   std::vector<ElementAccumulator *> ptr_beta_host(options.groups);
 
+  // EXPERIMENT: Calculate total size for concatenated scale buffers (like FlashInfer)
+  int total_sfa_size = 0;
+  int total_sfb_size = 0;
+  std::vector<int> sfa_sizes(options.groups);
+  std::vector<int> sfb_sizes(options.groups);
+  
+  for (int i = 0; i < options.groups; ++i) {
+    auto problem = options.problem_sizes_host.at(i);
+    auto [M, N, K] = problem;
+    auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+    sfa_sizes[i] = size(filter_zeros(layout_SFA));
+    sfb_sizes[i] = size(filter_zeros(layout_SFB));
+    total_sfa_size += sfa_sizes[i];
+    total_sfb_size += sfb_sizes[i];
+  }
+  
+  // Allocate concatenated buffers
+  HostTensorSFA concatenated_SFA(cutlass::make_Coord(total_sfa_size));
+  HostTensorSFB concatenated_SFB(cutlass::make_Coord(total_sfb_size));
+  
   block_alpha.reset(options.groups);
   block_beta.reset(options.groups);
   for (int i = 0; i < options.groups; ++i) {
@@ -374,6 +395,10 @@ void initialize(const Options &options) {
     block_ref_D.push_back(HostTensorD(cutlass::make_Coord(size(layout_D))));
   }
 
+  // Copy scale data to concatenated buffers
+  int sfa_offset = 0;
+  int sfb_offset = 0;
+  
   for (int i = 0; i < options.groups; ++i) {
     initialize_tensor(block_A.at(i).host_view(), cutlass::Distribution::Uniform, seed + 2022);
     initialize_tensor(block_B.at(i).host_view(), cutlass::Distribution::Uniform, seed + 2023);
@@ -381,23 +406,42 @@ void initialize(const Options &options) {
     initialize_tensor(block_SFA.at(i).host_view(), cutlass::Distribution::Uniform, seed + 2025);
     initialize_tensor(block_SFB.at(i).host_view(), cutlass::Distribution::Uniform, seed + 2026);
 
+    // Copy to concatenated buffers
+    memcpy(concatenated_SFA.host_data() + sfa_offset, block_SFA.at(i).host_data(), sfa_sizes[i] * sizeof(ElementSF));
+    memcpy(concatenated_SFB.host_data() + sfb_offset, block_SFB.at(i).host_data(), sfb_sizes[i] * sizeof(ElementSF));
+
     block_A.at(i).sync_device();
     block_B.at(i).sync_device();
     block_C.at(i).sync_device();
-    block_SFA.at(i).sync_device();
-    block_SFB.at(i).sync_device();
+    // Don't sync individual SFA/SFB - will sync concatenated later
+    
+    sfa_offset += sfa_sizes[i];
+    sfb_offset += sfb_sizes[i];
 
     ptr_A_host.at(i) = block_A.at(i).device_data();
     ptr_B_host.at(i) = block_B.at(i).device_data();
     ptr_C_host.at(i) = block_C.at(i).device_data();
     ptr_D_host.at(i) = block_D.at(i).device_data();
-    ptr_SFA_host.at(i) = block_SFA.at(i).device_data();
-    ptr_SFB_host.at(i) = block_SFB.at(i).device_data();
+    // Will be set after concatenated buffers are synced
 
     alpha_host.push_back((options.alpha == std::numeric_limits<float>::max()) ? static_cast<ElementAccumulator>((rand() % 5) + 1) : options.alpha);
     beta_host.push_back((options.beta == std::numeric_limits<float>::max()) ? static_cast<ElementAccumulator>(rand() % 5) : options.beta);
     ptr_alpha_host.at(i) = block_alpha.get() + i;
     ptr_beta_host.at(i) = block_beta.get() + i;
+  }
+  
+  // Sync concatenated buffers to device
+  concatenated_SFA.sync_device();
+  concatenated_SFB.sync_device();
+  
+  // Set scale pointers to offsets in concatenated buffers (like FlashInfer)
+  sfa_offset = 0;
+  sfb_offset = 0;
+  for (int i = 0; i < options.groups; ++i) {
+    ptr_SFA_host.at(i) = concatenated_SFA.device_data() + sfa_offset;
+    ptr_SFB_host.at(i) = concatenated_SFB.device_data() + sfb_offset;
+    sfa_offset += sfa_sizes[i];
+    sfb_offset += sfb_sizes[i];
   }
 
   problem_sizes.reset(options.groups);
@@ -548,7 +592,30 @@ bool verify(const Options &options) {
 
 
     block_D.at(i).sync_host();
-    passed &= cutlass::reference::host::TensorEquals(block_ref_D.at(i).host_view(), block_D.at(i).host_view());
+    bool group_passed = cutlass::reference::host::TensorEquals(block_ref_D.at(i).host_view(), block_D.at(i).host_view());
+    
+    if (!group_passed) {
+      // Print debug info for failing group
+      std::cout << "  Group " << i << " FAILED correctness check!" << std::endl;
+      std::cout << "    Problem size: " << M << "x" << N << "x" << K << std::endl;
+      
+      // Sample comparison (first 10 elements)
+      std::cout << "    Output[0, 0:10]:   ";
+      for (int j = 0; j < std::min(10, int(N)); ++j) {
+        std::cout << float(block_D.at(i).host_data()[j]) << " ";
+      }
+      std::cout << std::endl;
+      
+      std::cout << "    Expected[0, 0:10]: ";
+      for (int j = 0; j < std::min(10, int(N)); ++j) {
+        std::cout << float(block_ref_D.at(i).host_data()[j]) << " ";
+      }
+      std::cout << std::endl;
+      
+      std::cout << "    → Concatenated scales approach causes failure" << std::endl;
+    }
+    
+    passed &= group_passed;
   }
 
   return passed;
