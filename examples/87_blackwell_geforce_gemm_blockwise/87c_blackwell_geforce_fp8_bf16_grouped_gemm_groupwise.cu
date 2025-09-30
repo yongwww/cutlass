@@ -434,12 +434,32 @@ void initialize(const Options &options) {
   concatenated_SFA.sync_device();
   concatenated_SFB.sync_device();
   
-  // Set scale pointers to offsets in concatenated buffers (like FlashInfer)
+  // EXPERIMENT: Allocate independent buffers and copy from concatenated
+  // This tests if issue is pointer pattern vs data corruption
+  std::vector<cutlass::DeviceAllocation<ElementSF>> independent_SFA(options.groups);
+  std::vector<cutlass::DeviceAllocation<ElementSF>> independent_SFB(options.groups);
+  
   sfa_offset = 0;
   sfb_offset = 0;
   for (int i = 0; i < options.groups; ++i) {
-    ptr_SFA_host.at(i) = concatenated_SFA.device_data() + sfa_offset;
-    ptr_SFB_host.at(i) = concatenated_SFB.device_data() + sfb_offset;
+    // Allocate independent buffer
+    independent_SFA[i].reset(sfa_sizes[i]);
+    independent_SFB[i].reset(sfb_sizes[i]);
+    
+    // Copy data from concatenated to independent
+    cudaMemcpy(independent_SFA[i].get(), 
+               concatenated_SFA.device_data() + sfa_offset,
+               sfa_sizes[i] * sizeof(ElementSF),
+               cudaMemcpyDeviceToDevice);
+    cudaMemcpy(independent_SFB[i].get(),
+               concatenated_SFB.device_data() + sfb_offset,
+               sfb_sizes[i] * sizeof(ElementSF),
+               cudaMemcpyDeviceToDevice);
+    
+    // Point to independent allocations
+    ptr_SFA_host.at(i) = independent_SFA[i].get();
+    ptr_SFB_host.at(i) = independent_SFB[i].get();
+    
     sfa_offset += sfa_sizes[i];
     sfb_offset += sfb_sizes[i];
   }
