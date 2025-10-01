@@ -49,6 +49,8 @@
 */
 
 #include <iostream>
+#include <fstream>
+#include <string>
 
 #include "cutlass/cutlass.h"
 
@@ -227,6 +229,8 @@ struct Options {
 
   bool help = false;
   bool skip_verification = false;
+  bool load_flashinfer_data = false;
+  const char* flashinfer_data_dir = "/home/scratch.yowu_sw/workspace/flashinfer_cutlass_compare/";
 
   float alpha = 1.f, beta = 0.f;
   int iterations = 1000;
@@ -246,6 +250,11 @@ struct Options {
     if (cmd.check_cmd_line_flag("skip-verification")) {
       skip_verification = true;
     }
+    
+    if (cmd.check_cmd_line_flag("load-flashinfer-data")) {
+      load_flashinfer_data = true;
+      printf("DEBUG: Flag detected, load_flashinfer_data set to true\n");
+    }
 
     cmd.get_cmd_line_argument("m", m);
     cmd.get_cmd_line_argument("n", n);
@@ -264,6 +273,14 @@ struct Options {
       raster_order = RasterOrderOptions::AlongM;
     }
 
+    // When loading FlashInfer data, use dummy values (will be overridden)
+    if (load_flashinfer_data) {
+      groups = 2; // FlashInfer test case has 2 groups
+      m = 8192;
+      n = 4096;
+      k = 128;
+    }
+    
     for (int i = 0; i < groups; ++i) {
       problem_sizes_host.push_back({m, n, k});
     }
@@ -329,6 +346,237 @@ struct Result {
 /// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(const Options &options) {
   using namespace cute;
+  
+  printf("DEBUG: Entered initialize(), load_flashinfer_data=%d\n", options.load_flashinfer_data);
+  
+  // FLASHINFER DATA LOADING MODE
+  if (options.load_flashinfer_data) {
+    printf("=== LOADING FLASHINFER DATA ===\n");
+    printf("Step 1: Reading metadata...\n");
+    
+    // Read metadata
+    std::string data_dir(options.flashinfer_data_dir);
+    std::ifstream meta(data_dir + "metadata.txt");
+    if (!meta) {
+      printf("ERROR: Cannot open metadata file!\n");
+      return;
+    }
+    
+    int num_groups = 0, n_val = 0, k_val = 0, total_m = 0;
+    std::string line;
+    while (std::getline(meta, line)) {
+      if (sscanf(line.c_str(), "num_groups=%d", &num_groups) == 1) continue;
+      if (sscanf(line.c_str(), "n=%d", &n_val) == 1) continue;
+      if (sscanf(line.c_str(), "k=%d", &k_val) == 1) continue;
+      if (sscanf(line.c_str(), "total_m=%d", &total_m) == 1) continue;
+    }
+    meta.close();
+    
+    printf("Step 2: Loaded metadata: groups=%d, total_m=%d, n=%d, k=%d\n", num_groups, total_m, n_val, k_val);
+    
+    if (num_groups == 0 || total_m == 0) {
+      printf("ERROR: Invalid metadata!\n");
+      return;
+    }
+    
+    printf("Step 3: Creating tensors...\n");
+    
+    // Load binary tensors
+    auto load_bin = [&](const char* filename, void* data, size_t size) {
+      std::ifstream f(data_dir + filename, std::ios::binary);
+      if (!f) {
+        printf("ERROR: Failed to open %s\n", filename);
+        return false;
+      }
+      f.read((char*)data, size);
+      f.close();
+      printf("  Loaded %s: %zu bytes\n", filename, size);
+      return true;
+    };
+    
+    // Create single block for all data (FlashInfer has concatenated A, per-group B)
+    int m_per_group = total_m / num_groups;
+    
+    printf("Step 4: Allocating tensors (m_per_group=%d)...\n", m_per_group);
+    
+    // Allocate per-group tensors (verify expects per-group blocks)
+    for (int i = 0; i < num_groups; ++i) {
+      printf("  Allocating group %d...\n", i);
+      block_A.push_back(HostTensorA(cutlass::make_Coord(m_per_group * k_val)));
+      block_B.push_back(HostTensorB(cutlass::make_Coord(n_val * k_val)));
+      block_SFA.push_back(HostTensorSFA(cutlass::make_Coord(m_per_group)));
+      block_SFB.push_back(HostTensorSFB(cutlass::make_Coord(32)));
+      block_C.push_back(HostTensorC(cutlass::make_Coord(m_per_group * n_val)));
+      block_D.push_back(HostTensorD(cutlass::make_Coord(m_per_group * n_val)));
+      block_ref_D.push_back(HostTensorD(cutlass::make_Coord(m_per_group * n_val)));
+      // Initialize C to zero
+      memset(block_C[i].host_data(), 0, m_per_group * n_val * sizeof(ElementC));
+      block_C[i].sync_device();
+    }
+    
+    printf("Step 6: All tensors allocated\n");
+    
+    // Load A (concatenated) and split per-group
+    printf("Step 7: Loading A.bin and splitting per-group...\n");
+    std::vector<uint8_t> a_buffer(total_m * k_val * sizeof(ElementA));
+    load_bin("A.bin", a_buffer.data(), a_buffer.size());
+    for (int i = 0; i < num_groups; ++i) {
+      memcpy(block_A[i].host_data(), a_buffer.data() + i * m_per_group * k_val * sizeof(ElementA),
+             m_per_group * k_val * sizeof(ElementA));
+      block_A[i].sync_device();
+      printf("  Group %d A loaded and synced\n", i);
+    }
+    
+    printf("Step 8: Loading B.bin...\n");
+    // B is stored concatenated, load to temporary buffer then copy per-group
+    size_t b_buffer_size = num_groups * n_val * k_val * sizeof(ElementB);
+    printf("  Allocating buffer: %d * %d * %d * %zu = %zu bytes\n", 
+           num_groups, n_val, k_val, sizeof(ElementB), b_buffer_size);
+    std::vector<uint8_t> b_buffer(b_buffer_size);
+    load_bin("B.bin", b_buffer.data(), b_buffer.size());
+    for (int i = 0; i < num_groups; ++i) {
+      memcpy(block_B[i].host_data(), b_buffer.data() + i * n_val * k_val * sizeof(ElementB), 
+             n_val * k_val * sizeof(ElementB));
+      printf("  Group %d B copied\n", i);
+    }
+    
+    printf("Step 9: Loading SFA.bin and splitting per-group...\n");
+    std::vector<uint8_t> sfa_buffer(total_m * sizeof(ElementSF));
+    load_bin("SFA.bin", sfa_buffer.data(), sfa_buffer.size());
+    for (int i = 0; i < num_groups; ++i) {
+      memcpy(block_SFA[i].host_data(), sfa_buffer.data() + i * m_per_group * sizeof(ElementSF),
+             m_per_group * sizeof(ElementSF));
+      block_SFA[i].sync_device();
+      printf("  Group %d SFA loaded and synced\n", i);
+    }
+    
+    printf("Step 10: Loading SFB.bin...\n");
+    std::vector<uint8_t> sfb_buffer(num_groups * 32 * sizeof(ElementSF));
+    load_bin("SFB.bin", sfb_buffer.data(), sfb_buffer.size());
+    for (int i = 0; i < num_groups; ++i) {
+      memcpy(block_SFB[i].host_data(), sfb_buffer.data() + i * 32 * sizeof(ElementSF), 
+             32 * sizeof(ElementSF));
+      block_SFB[i].sync_device();
+      printf("  Group %d SFB loaded and synced\n", i);
+    }
+    
+    printf("Step 11: All data loaded and synced successfully\n");
+    
+    printf("Step 12: Setting up strides, layouts, and pointers...\n");
+    
+    std::vector<ElementA *> ptr_A_host(num_groups);
+    std::vector<ElementB *> ptr_B_host(num_groups);
+    std::vector<ElementSF *> ptr_SFA_host(num_groups);
+    std::vector<ElementSF *> ptr_SFB_host(num_groups);
+    std::vector<ElementD *> ptr_D_host(num_groups);
+    std::vector<typename ProblemShape::UnderlyingProblemShape> ps_host(num_groups);
+    std::vector<StrideA> sa_host(num_groups);
+    std::vector<StrideB> sb_host(num_groups);
+    std::vector<StrideD> sd_host(num_groups);
+    std::vector<LayoutSFA> lsa_host(num_groups);
+    std::vector<LayoutSFB> lsb_host(num_groups);
+    
+    printf("Step 12a: Vectors allocated\n");
+    
+    for (int i = 0; i < num_groups; ++i) {
+      printf("  Group %d: problem size\n", i);
+      ps_host[i] = typename ProblemShape::UnderlyingProblemShape(m_per_group, n_val, k_val);
+      
+      printf("  Group %d: strides\n", i);
+      sa_host[i] = cutlass::make_cute_packed_stride(StrideA{}, {m_per_group, k_val, 1});
+      sb_host[i] = cutlass::make_cute_packed_stride(StrideB{}, {n_val, k_val, 1});
+      sd_host[i] = cutlass::make_cute_packed_stride(StrideD{}, {m_per_group, n_val, 1});
+      
+      printf("  Group %d: layouts\n", i);
+      lsa_host[i] = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m_per_group, n_val, k_val, 1));
+      lsb_host[i] = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m_per_group, n_val, k_val, 1));
+      
+      printf("  Group %d: pointers\n", i);
+      // All blocks are now per-group (not concatenated)
+      ptr_A_host[i] = block_A[i].device_data();
+      ptr_B_host[i] = block_B[i].device_data();
+      ptr_SFA_host[i] = block_SFA[i].device_data();
+      ptr_SFB_host[i] = block_SFB[i].device_data();
+      ptr_D_host[i] = block_D[i].device_data();
+      printf("  Group %d: done\n", i);
+    }
+    
+    printf("Step 12b: Loop complete\n");
+    
+    // Copy to device
+    printf("Step 13: Copying to device arrays...\n");
+    printf("  problem_sizes.reset\n");
+    problem_sizes.reset(num_groups);
+    printf("  ptr_A.reset\n");
+    ptr_A.reset(num_groups);
+    printf("  ptr_B.reset\n");
+    ptr_B.reset(num_groups);
+    printf("  ptr_SFA.reset\n");
+    ptr_SFA.reset(num_groups);
+    printf("  ptr_SFB.reset\n");
+    ptr_SFB.reset(num_groups);
+    printf("  ptr_D.reset\n");
+    ptr_D.reset(num_groups);
+    printf("  stride_A.reset\n");
+    stride_A.reset(num_groups);
+    printf("  stride_B.reset\n");
+    stride_B.reset(num_groups);
+    printf("  stride_D.reset\n");
+    stride_D.reset(num_groups);
+    printf("  layout_SFA.reset\n");
+    layout_SFA.reset(num_groups);
+    printf("  layout_SFB.reset\n");
+    layout_SFB.reset(num_groups);
+    
+    printf("Step 13a: All .reset() done, now copying...\n");
+    problem_sizes.copy_from_host(ps_host.data());
+    ptr_A.copy_from_host(ptr_A_host.data());
+    ptr_B.copy_from_host(ptr_B_host.data());
+    ptr_SFA.copy_from_host(ptr_SFA_host.data());
+    ptr_SFB.copy_from_host(ptr_SFB_host.data());
+    ptr_D.copy_from_host(ptr_D_host.data());
+    stride_A.copy_from_host(sa_host.data());
+    stride_B.copy_from_host(sb_host.data());
+    stride_D.copy_from_host(sd_host.data());
+    layout_SFA.copy_from_host(lsa_host.data());
+    layout_SFB.copy_from_host(lsb_host.data());
+    printf("Step 13b: All copies done\n");
+    
+    // Skip alpha/beta setup - the run() function should handle defaults
+    printf("Step 14: Skipping alpha/beta (will use defaults)\n");
+    
+    // Also need to set up stride_C and ptr_C for the gemm run
+    stride_C.reset(num_groups);
+    ptr_C.reset(num_groups);
+    std::vector<StrideC> sc_host(num_groups);
+    std::vector<ElementC *> ptr_C_host(num_groups);
+    for (int i = 0; i < num_groups; ++i) {
+      sc_host[i] = cutlass::make_cute_packed_stride(StrideC{}, {m_per_group, n_val, 1});
+      ptr_C_host[i] = nullptr; // No C input
+    }
+    stride_C.copy_from_host(sc_host.data());
+    ptr_C.copy_from_host(ptr_C_host.data());
+    
+    // Set up host-side metadata for verify() function
+    stride_A_host = sa_host;
+    stride_B_host = sb_host;
+    stride_C_host = sc_host;
+    stride_D_host = sd_host;
+    layout_SFA_host = lsa_host;
+    layout_SFB_host = lsb_host;
+    
+    // Also need alpha/beta host values
+    alpha_host.clear();
+    beta_host.clear();
+    for (int i = 0; i < num_groups; ++i) {
+      alpha_host.push_back(1.0f);
+      beta_host.push_back(0.0f);
+    }
+    
+    printf("=== FLASHINFER DATA LOADED, READY TO RUN ===\n\n");
+    printf("About to return from initialize()\n");
+    return; // Skip normal initialization
+  }
 
   std::vector<ElementA *> ptr_A_host(options.groups);
   std::vector<ElementB *> ptr_B_host(options.groups);
@@ -744,6 +992,8 @@ int main(int argc, char const **args) {
   Options options;
 
   options.parse(argc, args);
+  
+  printf("DEBUG: Options parsed, load_flashinfer_data=%d\n", options.load_flashinfer_data);
 
   if (options.help) {
     options.print_usage(std::cout) << std::endl;
@@ -754,6 +1004,7 @@ int main(int argc, char const **args) {
   // Run
   //
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  printf("DEBUG: About to call initialize()\n");
   initialize(options);
   run<Gemm>(options);
 #endif // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
